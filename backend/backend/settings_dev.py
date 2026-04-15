@@ -21,3 +21,8 @@ ALLOWED_HOSTS = ['*']
 
 # Email backend for development (prints to console)
 EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
+
+# 2FA encryption key for development (hardcoded so .env is not required)
+# In production, set TOTP_ENCRYPTION_KEY in your environment or .env
+if not TOTP_ENCRYPTION_KEY:
+    TOTP_ENCRYPTION_KEY = 'b3vqrjREHENAnZO1zxVXtmS-hg8u5RaYmaeuVUmMgl4='
