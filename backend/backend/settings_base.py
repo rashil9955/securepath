@@ -120,7 +120,7 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 # CORS SETTINGS
 CORS_ALLOWED_ORIGINS = env.list(
     'CORS_ALLOWED_ORIGINS',
-    default=['http://localhost:3000', 'http://127.0.0.1:3000']
+    default=['http://localhost:3000', 'http://127.0.0.1:3000', 'http://localhost:3001', 'http://127.0.0.1:3001']
 )
 CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOW_METHODS = ['DELETE', 'GET', 'OPTIONS', 'PATCH', 'POST', 'PUT']
@@ -140,6 +140,14 @@ FILE_UPLOAD_MAX_MEMORY_SIZE = env.int('FILE_UPLOAD_MAX_MEMORY_SIZE', default=419
 PLAID_CLIENT_ID = env('PLAID_CLIENT_ID', default='')
 PLAID_SECRET = env('PLAID_SECRET', default='')
 PLAID_ENV = env('PLAID_ENV', default='sandbox')
+
+# 2FA / TOTP SETTINGS
+# TOTP secrets are encrypted with Fernet (symmetric, reversible) rather than
+# hashed because the server must reconstruct the secret on every OTP check.
+# Generate the key once with:
+#   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# Then add it to .env as: TOTP_ENCRYPTION_KEY=<value>
+TOTP_ENCRYPTION_KEY = env('TOTP_ENCRYPTION_KEY', default='')
 
 # CELERY CONFIGURATION
 CELERY_BROKER_URL = env('CELERY_BROKER_URL', default='redis://localhost:6379/0')

@@ -916,9 +916,25 @@ def run_cleansing(request):
 
 # AUTHENTICATION ROUTES
 # ==========================================
-from api.schemas import UserRegister, UserLogin, UserResponse, TokenResponse
+from api.schemas import (
+    UserRegister, UserLogin, UserResponse, TokenResponse,
+    TwoFASetupResponse, TwoFAEnableRequest, TwoFAEnableResponse,
+    TwoFADisableRequest, TwoFALoginVerifyRequest,
+    TwoFAStatusResponse, TwoFABackupCodesResponse,
+)
+from api.jwt_auth import create_2fa_pending_token
+from api.totp_auth import (
+    generate_totp_secret, encrypt_totp_secret, decrypt_totp_secret,
+    generate_qr_code_base64,
+    verify_totp,
+    generate_backup_codes, hash_backup_codes, consume_backup_code,
+    check_otp_rate_limit, record_otp_failure, reset_otp_failures,
+    generate_device_token, store_device_token, verify_device_token,
+    DEVICE_TRUST_DAYS,
+)
 from django.http import HttpResponse
 from datetime import timedelta
+import json
 
 @router.post("/auth/register", auth=None)
 def register(request, user_data: UserRegister):
@@ -1037,12 +1053,30 @@ def login(request, user_data: UserLogin):
         # Check if user is active
         if not user.is_active:
             return JsonResponse({"error": "User account is inactive"}, status=403)
-        
+
+        # ── 2FA check ────────────────────────────────────────────────────────
+        if user.is_2fa_enabled:
+            # Check "remember this device" cookie before demanding OTP
+            device_token = request.COOKIES.get("device_token")
+            if device_token and verify_device_token(user, device_token):
+                # Trusted device — skip OTP, fall through to normal token issuance
+                pass
+            else:
+                # Issue a short-lived pending token; real tokens come after OTP
+                pending_token = create_2fa_pending_token({"sub": user.id, "email": user.email})
+                logger.info(f"2FA required for user {user.email}")
+                return JsonResponse({
+                    "requires_2fa": True,
+                    "two_fa_token": pending_token,
+                    "message": "Please verify your 2FA code.",
+                })
+        # ─────────────────────────────────────────────────────────────────────
+
         # Create tokens
         token_data = {"sub": user.id, "email": user.email}
         access_token = create_access_token(token_data)
         refresh_token_str = create_refresh_token(token_data)
-        
+
         # Revoke old refresh tokens and save new one
         RefreshToken.objects.filter(user=user).update(is_revoked=True)
         refresh_token_expires = timezone.now() + timedelta(days=7)
@@ -1051,7 +1085,7 @@ def login(request, user_data: UserLogin):
             user=user,
             expires_at=refresh_token_expires
         )
-        
+
         # Create response with cookies
         response_data = {
             "access_token": access_token,
@@ -1064,7 +1098,7 @@ def login(request, user_data: UserLogin):
                 "created_at": user.created_at.isoformat()
             }
         }
-        
+
         response = JsonResponse(response_data)
         response.set_cookie(
             key="access_token",
@@ -1082,9 +1116,9 @@ def login(request, user_data: UserLogin):
             samesite="lax",
             max_age=7 * 24 * 60 * 60
         )
-        
+
         return response
-        
+
     except Exception as e:
         logger.error(f"Login error: {str(e)}")
         return JsonResponse({"error": f"Login failed: {str(e)}"}, status=500)
@@ -1199,5 +1233,436 @@ def refresh_access_token(request):
         logger.error(f"Refresh token error: {str(e)}\n{traceback.format_exc()}")
         return JsonResponse({"error": "Failed to refresh token"}, status=500)
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2FA ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Flow overview
+# ─────────────
+# SETUP:
+#   1. POST /2fa/setup          → generates pending secret + QR (no DB write yet)
+#   2. POST /2fa/enable  {otp}  → verifies first OTP, promotes secret, enables 2FA
+#                                  returns one-time backup codes
+#
+# LOGIN (when 2FA is enabled):
+#   1. POST /auth/login         → password OK → returns {requires_2fa, two_fa_token}
+#   2. POST /2fa/login-verify   → OTP + two_fa_token → returns real JWT tokens
+#      (if "remember_device":true, also sets a 30-day device cookie)
+#
+# MANAGEMENT:
+#   GET  /2fa/status            → is_2fa_enabled, backup_codes_remaining
+#   POST /2fa/disable           → password + OTP/backup → disables 2FA
+#   POST /2fa/backup-codes/regenerate → OTP → new set of backup codes
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _resolve_authenticated_user(request) -> Optional[User]:
+    """
+    Extract the authenticated User from a request bearing a Bearer JWT.
+    Returns None if unauthenticated.
+    """
+    auth_header = request.META.get("HTTP_AUTHORIZATION", "")
+    if not auth_header.startswith("Bearer "):
+        return None
+    token = auth_header.split(" ", 1)[1]
+    payload = verify_token(token, token_type="access")
+    if not payload:
+        return None
+    return User.objects.filter(id=payload.get("sub"), is_active=True).first()
+
+
+def _issue_full_tokens(user: User) -> JsonResponse:
+    """
+    Create access + refresh tokens, persist the refresh token, and return
+    a JsonResponse with both tokens in the body and as httpOnly cookies.
+    Extracted here so login and 2FA login-verify share identical behaviour.
+    """
+    token_data = {"sub": user.id, "email": user.email}
+    access_token = create_access_token(token_data)
+    refresh_token_str = create_refresh_token(token_data)
+
+    RefreshToken.objects.filter(user=user).update(is_revoked=True)
+    RefreshToken.objects.create(
+        token=refresh_token_str,
+        user=user,
+        expires_at=timezone.now() + timedelta(days=7),
+    )
+
+    response = JsonResponse({
+        "access_token": access_token,
+        "refresh_token": refresh_token_str,
+        "token_type": "bearer",
+        "user": {
+            "id": user.id,
+            "email": user.email,
+            "is_active": user.is_active,
+            "created_at": user.created_at.isoformat(),
+        },
+    })
+    response.set_cookie("access_token", access_token,
+                        httponly=True, secure=False, samesite="lax", max_age=30 * 60)
+    response.set_cookie("refresh_token", refresh_token_str,
+                        httponly=True, secure=False, samesite="lax",
+                        max_age=7 * 24 * 60 * 60)
+    return response
+
+
+# ── POST /2fa/setup ───────────────────────────────────────────────────────────
+
+@router.post("/2fa/setup", auth=auth_bearer)
+def setup_2fa(request):
+    """
+    Generate a new TOTP secret and return the QR code + manual key.
+    The secret is stored as *pending* (totp_pending_secret) and 2FA is NOT
+    enabled yet.  The user must call POST /2fa/enable with a valid OTP first.
+
+    Calling this endpoint again before enabling simply overwrites the pending
+    secret, which is safe — the previous pending secret is discarded.
+
+    Response
+    --------
+    {
+      "qr_code":    "<base64 PNG>",
+      "manual_key": "<Base32 secret>",
+      "message":    "Scan the QR code …"
+    }
+    """
+    user = _resolve_authenticated_user(request)
+    if not user:
+        return JsonResponse({"error": "Authentication required."}, status=401)
+
+    if user.is_2fa_enabled:
+        return JsonResponse(
+            {"error": "2FA is already enabled. Disable it first to set up a new authenticator."},
+            status=400,
+        )
+
+    plaintext_secret = generate_totp_secret()
+    user.totp_pending_secret = encrypt_totp_secret(plaintext_secret)
+    user.save(update_fields=["totp_pending_secret"])
+
+    qr_code = generate_qr_code_base64(user.email, plaintext_secret)
+
+    logger.info(f"2FA setup initiated for user {user.email}")
+    return JsonResponse({
+        "qr_code": qr_code,
+        "manual_key": plaintext_secret,
+        "message": (
+            "Scan the QR code with Google Authenticator, Authy, or any TOTP app. "
+            "Save the manual key as a fallback. Then call POST /2fa/enable with "
+            "the 6-digit code to activate 2FA."
+        ),
+    })
+
+
+# ── POST /2fa/enable ──────────────────────────────────────────────────────────
+
+@router.post("/2fa/enable", auth=auth_bearer)
+def enable_2fa(request, data: TwoFAEnableRequest):
+    """
+    Verify the first OTP from the user's authenticator app and enable 2FA.
+    Also generates and returns 8 one-time backup codes — shown ONCE.
+
+    The user must have called POST /2fa/setup first.
+
+    Returns
+    -------
+    { "message": "…", "backup_codes": ["xxxxx-xxxxx", …] }
+    """
+    user = _resolve_authenticated_user(request)
+    if not user:
+        return JsonResponse({"error": "Authentication required."}, status=401)
+
+    if user.is_2fa_enabled:
+        return JsonResponse({"error": "2FA is already enabled."}, status=400)
+
+    if not user.totp_pending_secret:
+        return JsonResponse(
+            {"error": "No pending 2FA setup found. Call POST /2fa/setup first."},
+            status=400,
+        )
+
+    allowed, err = check_otp_rate_limit(user)
+    if not allowed:
+        return JsonResponse({"error": err}, status=429)
+
+    plaintext_secret = decrypt_totp_secret(user.totp_pending_secret)
+    valid, counter = verify_totp(plaintext_secret, data.otp, user.last_otp_counter)
+
+    if not valid:
+        record_otp_failure(user)
+        logger.warning(f"2FA enable failed (bad OTP) for user {user.email}")
+        return JsonResponse({"error": "Invalid OTP. Check your authenticator app and try again."}, status=400)
+
+    # Promote pending secret → active secret
+    plaintext_backup_codes = generate_backup_codes()
+    user.totp_secret = user.totp_pending_secret
+    user.totp_pending_secret = None
+    user.is_2fa_enabled = True
+    user.last_otp_counter = counter
+    user.backup_codes = hash_backup_codes(plaintext_backup_codes)
+    user.save(update_fields=[
+        "totp_secret", "totp_pending_secret", "is_2fa_enabled",
+        "last_otp_counter", "backup_codes",
+    ])
+    reset_otp_failures(user)
+
+    AuditLog.objects.create(
+        user=user,
+        action="2FA Enabled",
+        details="User enabled two-factor authentication.",
+        user_string=user.email,
+        ip_address=request.META.get("REMOTE_ADDR"),
+    )
+    logger.info(f"2FA enabled for user {user.email}")
+
+    return JsonResponse({
+        "message": "2FA has been enabled. Save your backup codes — they will not be shown again.",
+        "backup_codes": plaintext_backup_codes,
+    })
+
+
+# ── POST /2fa/login-verify ────────────────────────────────────────────────────
+
+@router.post("/2fa/login-verify", auth=None)
+def login_verify_2fa(request, data: TwoFALoginVerifyRequest):
+    """
+    Complete a 2FA login.  Called after POST /auth/login returns requires_2fa=true.
+
+    Accepts either a TOTP code (otp) or a backup code (backup_code).
+    If remember_device=true, sets a 30-day httpOnly device cookie so this
+    device is trusted on future logins.
+
+    Request body
+    ------------
+    {
+      "two_fa_token": "<pending token from /auth/login>",
+      "otp":          "123456",          // OR
+      "backup_code":  "ab3f9-xk28p",
+      "remember_device": false
+    }
+    """
+    # Validate the pending token
+    payload = verify_token(data.two_fa_token, token_type="2fa_pending")
+    if not payload:
+        return JsonResponse({"error": "Invalid or expired 2FA session. Please log in again."}, status=401)
+
+    user = User.objects.filter(id=payload.get("sub"), is_active=True).first()
+    if not user or not user.is_2fa_enabled:
+        return JsonResponse({"error": "User not found or 2FA not enabled."}, status=400)
+
+    allowed, err = check_otp_rate_limit(user)
+    if not allowed:
+        return JsonResponse({"error": err}, status=429)
+
+    verified = False
+
+    if data.otp:
+        # TOTP path
+        if not user.totp_secret:
+            return JsonResponse({"error": "2FA is not configured for this account."}, status=400)
+        plaintext_secret = decrypt_totp_secret(user.totp_secret)
+        valid, counter = verify_totp(plaintext_secret, data.otp, user.last_otp_counter)
+        if valid:
+            user.last_otp_counter = counter
+            user.save(update_fields=["last_otp_counter"])
+            verified = True
+
+    elif data.backup_code:
+        # Backup-code path
+        if not user.backup_codes:
+            return JsonResponse({"error": "No backup codes available."}, status=400)
+        ok, updated_json = consume_backup_code(data.backup_code, user.backup_codes)
+        if ok:
+            user.backup_codes = updated_json
+            user.save(update_fields=["backup_codes"])
+            verified = True
+            AuditLog.objects.create(
+                user=user,
+                action="2FA Backup Code Used",
+                details="User authenticated with a backup code.",
+                user_string=user.email,
+                ip_address=request.META.get("REMOTE_ADDR"),
+            )
+            logger.warning(f"Backup code used for user {user.email}")
+
+    if not verified:
+        record_otp_failure(user)
+        logger.warning(f"2FA login-verify failed for user {user.email}")
+        return JsonResponse({"error": "Invalid code. Please try again."}, status=401)
+
+    reset_otp_failures(user)
+    AuditLog.objects.create(
+        user=user,
+        action="2FA Login Success",
+        details="User completed 2FA login.",
+        user_string=user.email,
+        ip_address=request.META.get("REMOTE_ADDR"),
+    )
+
+    response = _issue_full_tokens(user)
+
+    # "Remember this device" — 30-day device cookie
+    if data.remember_device:
+        device_token = generate_device_token()
+        store_device_token(user, device_token)
+        response.set_cookie(
+            "device_token",
+            device_token,
+            httponly=True,
+            secure=False,
+            samesite="lax",
+            max_age=DEVICE_TRUST_DAYS * 24 * 60 * 60,
+        )
+
+    return response
+
+
+# ── GET /2fa/status ───────────────────────────────────────────────────────────
+
+@router.get("/2fa/status", auth=auth_bearer)
+def get_2fa_status(request):
+    """
+    Return the current 2FA status and remaining backup code count for the
+    authenticated user.
+    """
+    user = _resolve_authenticated_user(request)
+    if not user:
+        return JsonResponse({"error": "Authentication required."}, status=401)
+
+    remaining = None
+    if user.backup_codes:
+        try:
+            remaining = len(json.loads(user.backup_codes))
+        except (ValueError, TypeError):
+            remaining = 0
+
+    return JsonResponse({
+        "is_2fa_enabled": user.is_2fa_enabled,
+        "backup_codes_remaining": remaining,
+    })
+
+
+# ── POST /2fa/disable ─────────────────────────────────────────────────────────
+
+@router.post("/2fa/disable", auth=auth_bearer)
+def disable_2fa(request, data: TwoFADisableRequest):
+    """
+    Disable 2FA for the authenticated user.
+    Requires the account password AND either a valid OTP or a backup code.
+
+    Request body
+    ------------
+    { "password": "…", "otp": "123456" }   // or "backup_code": "xxxxx-xxxxx"
+    """
+    user = _resolve_authenticated_user(request)
+    if not user:
+        return JsonResponse({"error": "Authentication required."}, status=401)
+
+    if not user.is_2fa_enabled:
+        return JsonResponse({"error": "2FA is not enabled on this account."}, status=400)
+
+    # Password check
+    if not user.hashed_password or not verify_password(data.password, user.hashed_password):
+        return JsonResponse({"error": "Incorrect password."}, status=401)
+
+    allowed, err = check_otp_rate_limit(user)
+    if not allowed:
+        return JsonResponse({"error": err}, status=429)
+
+    verified = False
+
+    if data.otp and user.totp_secret:
+        plaintext_secret = decrypt_totp_secret(user.totp_secret)
+        valid, counter = verify_totp(plaintext_secret, data.otp, user.last_otp_counter)
+        if valid:
+            user.last_otp_counter = counter
+            verified = True
+
+    elif data.backup_code and user.backup_codes:
+        ok, updated_json = consume_backup_code(data.backup_code, user.backup_codes)
+        if ok:
+            user.backup_codes = updated_json
+            verified = True
+
+    if not verified:
+        record_otp_failure(user)
+        return JsonResponse({"error": "Invalid OTP or backup code."}, status=401)
+
+    # Clear all 2FA state
+    user.is_2fa_enabled = False
+    user.totp_secret = None
+    user.totp_pending_secret = None
+    user.backup_codes = None
+    user.last_otp_counter = None
+    user.trusted_device_tokens = None
+    user.save(update_fields=[
+        "is_2fa_enabled", "totp_secret", "totp_pending_secret",
+        "backup_codes", "last_otp_counter", "trusted_device_tokens",
+    ])
+    reset_otp_failures(user)
+
+    AuditLog.objects.create(
+        user=user,
+        action="2FA Disabled",
+        details="User disabled two-factor authentication.",
+        user_string=user.email,
+        ip_address=request.META.get("REMOTE_ADDR"),
+    )
+    logger.info(f"2FA disabled for user {user.email}")
+
+    response = JsonResponse({"message": "2FA has been disabled."})
+    response.delete_cookie("device_token")
+    return response
+
+
+# ── POST /2fa/backup-codes/regenerate ────────────────────────────────────────
+
+@router.post("/2fa/backup-codes/regenerate", auth=auth_bearer)
+def regenerate_backup_codes(request, data: TwoFAEnableRequest):
+    """
+    Regenerate backup codes.  Requires a valid OTP.
+    Old codes are immediately invalidated.
+
+    Request body
+    ------------
+    { "otp": "123456" }
+    """
+    user = _resolve_authenticated_user(request)
+    if not user:
+        return JsonResponse({"error": "Authentication required."}, status=401)
+
+    if not user.is_2fa_enabled or not user.totp_secret:
+        return JsonResponse({"error": "2FA is not enabled on this account."}, status=400)
+
+    allowed, err = check_otp_rate_limit(user)
+    if not allowed:
+        return JsonResponse({"error": err}, status=429)
+
+    plaintext_secret = decrypt_totp_secret(user.totp_secret)
+    valid, counter = verify_totp(plaintext_secret, data.otp, user.last_otp_counter)
+    if not valid:
+        record_otp_failure(user)
+        return JsonResponse({"error": "Invalid OTP."}, status=400)
+
+    new_codes = generate_backup_codes()
+    user.backup_codes = hash_backup_codes(new_codes)
+    user.last_otp_counter = counter
+    user.save(update_fields=["backup_codes", "last_otp_counter"])
+    reset_otp_failures(user)
+
+    AuditLog.objects.create(
+        user=user,
+        action="2FA Backup Codes Regenerated",
+        details="User regenerated backup codes.",
+        user_string=user.email,
+        ip_address=request.META.get("REMOTE_ADDR"),
+    )
+
+    return JsonResponse({
+        "message": "New backup codes generated. Save them — they will not be shown again.",
+        "backup_codes": new_codes,
+    })
 
 # OAuth routes removed - using simple email/password authentication only
