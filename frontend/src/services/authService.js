@@ -122,6 +122,37 @@ export const authService = {
         return data;
     },
 
+    async changePassword(currentPassword, otp, newPassword, confirmPassword) {
+        return apiCall('/auth/change-password', {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${this.getAccessToken()}` },
+            body: JSON.stringify({
+                current_password: currentPassword,
+                otp,
+                new_password: newPassword,
+                confirm_password: confirmPassword,
+            }),
+        });
+    },
+
+    async forgotPasswordVerify(email, otp) {
+        return apiCall('/auth/forgot-password/verify', {
+            method: 'POST',
+            body: JSON.stringify({ email, otp }),
+        });
+    },
+
+    async forgotPasswordReset(resetToken, newPassword, confirmPassword) {
+        return apiCall('/auth/forgot-password/reset', {
+            method: 'POST',
+            body: JSON.stringify({
+                reset_token: resetToken,
+                new_password: newPassword,
+                confirm_password: confirmPassword,
+            }),
+        });
+    },
+
     async logout() {
         try {
             await apiCall('/auth/logout', {

@@ -121,3 +121,29 @@ class TwoFABackupCodesResponse(Schema):
     """Returned when backup codes are regenerated."""
     message: str
     backup_codes: list
+
+
+# ── Forgot Password Schemas ───────────────────────────────────────────────────
+
+class ForgotPasswordVerifyRequest(Schema):
+    """Step 1: verify identity via email + TOTP code."""
+    email: EmailStr
+    otp: str = Field(..., min_length=6, max_length=6)
+
+class ForgotPasswordVerifyResponse(Schema):
+    """Short-lived token that authorises the password reset."""
+    reset_token: str
+    message: str
+
+class ForgotPasswordResetRequest(Schema):
+    """Step 2: supply the reset token and the new password."""
+    reset_token: str
+    new_password: str = Field(..., min_length=8)
+    confirm_password: str = Field(..., min_length=8)
+
+class ChangePasswordRequest(Schema):
+    """Change password while logged in: current password + TOTP + new password."""
+    current_password: str
+    otp: str = Field(..., min_length=6, max_length=6)
+    new_password: str = Field(..., min_length=8)
+    confirm_password: str = Field(..., min_length=8)

@@ -12,11 +12,13 @@ import AuditLogView from './components/AuditLog/AuditLogView';
 import ReportsView from './components/Reports/ReportsView';
 import LoginPage from './pages/LoginPage';
 import RegisterPage from './pages/RegisterPage';
+import ForgotPasswordPage from './pages/ForgotPasswordPage';
 import TwoFAModal from './components/TwoFAModal';
+import ChangePasswordModal from './components/ChangePasswordModal';
 import { useDashboardData } from './hooks/useDashboardData';
 import { NAV_ITEMS } from './config/constants';
 import { useAuth } from './contexts/AuthContext';
-import { LogOut, ShieldCheck, ShieldOff, ChevronDown } from 'lucide-react';
+import { LogOut, ShieldCheck, ShieldOff, ChevronDown, Lock } from 'lucide-react';
 
 // Dashboard component (protected)
 function SecurePathDashboard() {
@@ -46,6 +48,7 @@ function SecurePathDashboard() {
 
     const [showDropdown, setShowDropdown] = useState(false);
     const [show2FAModal, setShow2FAModal] = useState(false);
+    const [showChangePasswordModal, setShowChangePasswordModal] = useState(false);
     const [twoFAEnabled, setTwoFAEnabled] = useState(null); // null = unknown
     const dropdownRef = useRef(null);
 
@@ -141,6 +144,18 @@ function SecurePathDashboard() {
                                             </div>
                                         </button>
 
+                                        {/* Change password option */}
+                                        <button
+                                            onClick={() => { setShowDropdown(false); setShowChangePasswordModal(true); }}
+                                            className="w-full flex items-center gap-3 px-4 py-3 hover:bg-white/5 transition-colors text-left"
+                                        >
+                                            <Lock size={18} className="text-gray-400" />
+                                            <div>
+                                                <p className="text-sm text-white">Change Password</p>
+                                                <p className="text-xs text-gray-400">Requires current password + 2FA</p>
+                                            </div>
+                                        </button>
+
                                         {/* Divider */}
                                         <div className="border-t border-white/10" />
 
@@ -170,6 +185,9 @@ function SecurePathDashboard() {
                     onStatusChange={(enabled) => setTwoFAEnabled(enabled)}
                 />
             )}
+            {showChangePasswordModal && (
+                <ChangePasswordModal onClose={() => setShowChangePasswordModal(false)} />
+            )}
         </ErrorBoundary>
     );
 }
@@ -182,6 +200,7 @@ export default function App() {
                 <Routes>
                     <Route path="/login" element={<LoginPage />} />
                     <Route path="/register" element={<RegisterPage />} />
+                    <Route path="/forgot-password" element={<ForgotPasswordPage />} />
                     <Route
                         path="/dashboard"
                         element={

@@ -14,8 +14,8 @@ import logging
 
 from api.models import Transaction, SystemMetrics, AuditLog, User, OAuthAccount, RefreshToken
 from api.jwt_auth import (
-    verify_password, get_password_hash, create_access_token, 
-    create_refresh_token, verify_token
+    verify_password, get_password_hash, create_access_token,
+    create_refresh_token, verify_token, create_password_reset_token
 )
 from django.db import IntegrityError
 from django.http import JsonResponse
@@ -921,6 +921,8 @@ from api.schemas import (
     TwoFASetupResponse, TwoFAEnableRequest, TwoFAEnableResponse,
     TwoFADisableRequest, TwoFALoginVerifyRequest,
     TwoFAStatusResponse, TwoFABackupCodesResponse,
+    ForgotPasswordVerifyRequest, ForgotPasswordVerifyResponse, ForgotPasswordResetRequest,
+    ChangePasswordRequest,
 )
 from api.jwt_auth import create_2fa_pending_token
 from api.totp_auth import (
@@ -1232,6 +1234,149 @@ def refresh_access_token(request):
         import traceback
         logger.error(f"Refresh token error: {str(e)}\n{traceback.format_exc()}")
         return JsonResponse({"error": "Failed to refresh token"}, status=500)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FORGOT PASSWORD ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.post("/auth/forgot-password/verify", auth=None)
+def forgot_password_verify(request, data: ForgotPasswordVerifyRequest):
+    """
+    Step 1 of forgot-password flow.
+    Verify identity by checking email + TOTP code from the authenticator app.
+    Returns a short-lived (10-min) password_reset token on success.
+    """
+    import traceback
+    try:
+        user = User.objects.filter(email=data.email, is_active=True).first()
+        # Always return the same error shape — don't leak whether the email exists
+        if not user or not user.is_2fa_enabled or not user.totp_secret:
+            return JsonResponse(
+                {"error": "No account with 2FA found for that email address."},
+                status=400,
+            )
+
+        # Rate-limit OTP attempts
+        from api.totp_auth import (
+            check_otp_rate_limit, record_otp_failure, reset_otp_failures,
+            decrypt_totp_secret, verify_totp,
+        )
+        allowed, wait_seconds = check_otp_rate_limit(user)
+        if not allowed:
+            return JsonResponse(
+                {"error": f"Too many failed attempts. Try again in {wait_seconds} seconds."},
+                status=429,
+            )
+
+        plaintext_secret = decrypt_totp_secret(user.totp_secret)
+        valid, new_counter = verify_totp(plaintext_secret, data.otp, user.last_otp_counter)
+        if not valid:
+            record_otp_failure(user)
+            return JsonResponse({"error": "Invalid or expired authenticator code."}, status=400)
+
+        user.last_otp_counter = new_counter
+        user.otp_failed_attempts = 0
+        user.otp_lockout_until = None
+        user.save(update_fields=["last_otp_counter", "otp_failed_attempts", "otp_lockout_until"])
+        reset_token = create_password_reset_token({"sub": user.id, "email": user.email})
+        return {"reset_token": reset_token, "message": "Identity verified. You may now set a new password."}
+
+    except Exception as e:
+        logger.error(f"forgot_password_verify error: {e}\n{traceback.format_exc()}")
+        return JsonResponse({"error": "Verification failed."}, status=500)
+
+
+@router.post("/auth/forgot-password/reset", auth=None)
+def forgot_password_reset(request, data: ForgotPasswordResetRequest):
+    """
+    Step 2 of forgot-password flow.
+    Accepts the password_reset token from step 1 and sets a new password.
+    """
+    import traceback
+    try:
+        payload = verify_token(data.reset_token, token_type="password_reset")
+        if not payload:
+            return JsonResponse({"error": "Reset link is invalid or has expired."}, status=400)
+
+        if data.new_password != data.confirm_password:
+            return JsonResponse({"error": "Passwords do not match."}, status=400)
+
+        if len(data.new_password.encode("utf-8")) > 72:
+            return JsonResponse({"error": "Password must be 72 characters or fewer."}, status=400)
+
+        user = User.objects.filter(id=payload["sub"], is_active=True).first()
+        if not user:
+            return JsonResponse({"error": "User not found."}, status=404)
+
+        user.hashed_password = get_password_hash(data.new_password)
+        user.save(update_fields=["hashed_password"])
+
+        # Revoke all existing refresh tokens so old sessions are invalidated
+        RefreshToken.objects.filter(user=user).update(is_revoked=True)
+
+        return JsonResponse({"message": "Password updated successfully. Please log in with your new password."})
+
+    except Exception as e:
+        logger.error(f"forgot_password_reset error: {e}\n{traceback.format_exc()}")
+        return JsonResponse({"error": "Password reset failed."}, status=500)
+
+
+@router.post("/auth/change-password", auth=auth_bearer)
+def change_password(request, data: ChangePasswordRequest):
+    """
+    Change password while logged in.
+    Requires current password + TOTP code + new password.
+    """
+    import traceback
+    try:
+        auth_header = request.META.get('HTTP_AUTHORIZATION', '')
+        if not auth_header.startswith('Bearer '):
+            return JsonResponse({"error": "Unauthorized."}, status=401)
+        token = auth_header.split(' ')[1]
+        payload = verify_token(token, token_type="access")
+        if not payload:
+            return JsonResponse({"error": "Invalid or expired session."}, status=401)
+
+        user = User.objects.filter(id=payload["sub"], is_active=True).first()
+        if not user:
+            return JsonResponse({"error": "User not found."}, status=404)
+
+        # Verify current password
+        if not user.hashed_password or not verify_password(data.current_password, user.hashed_password):
+            return JsonResponse({"error": "Current password is incorrect."}, status=400)
+
+        # Verify TOTP (required — all accounts have 2FA)
+        if not user.is_2fa_enabled or not user.totp_secret:
+            return JsonResponse({"error": "2FA is not enabled on this account."}, status=400)
+
+        allowed, wait_msg = check_otp_rate_limit(user)
+        if not allowed:
+            return JsonResponse({"error": wait_msg}, status=429)
+
+        plaintext_secret = decrypt_totp_secret(user.totp_secret)
+        valid, new_counter = verify_totp(plaintext_secret, data.otp, user.last_otp_counter)
+        if not valid:
+            record_otp_failure(user)
+            return JsonResponse({"error": "Invalid or expired authenticator code."}, status=400)
+
+        if data.new_password != data.confirm_password:
+            return JsonResponse({"error": "Passwords do not match."}, status=400)
+
+        if len(data.new_password.encode("utf-8")) > 72:
+            return JsonResponse({"error": "Password must be 72 characters or fewer."}, status=400)
+
+        user.hashed_password = get_password_hash(data.new_password)
+        user.last_otp_counter = new_counter
+        user.otp_failed_attempts = 0
+        user.otp_lockout_until = None
+        user.save(update_fields=["hashed_password", "last_otp_counter", "otp_failed_attempts", "otp_lockout_until"])
+
+        return JsonResponse({"message": "Password changed successfully."})
+
+    except Exception as e:
+        logger.error(f"change_password error: {e}\n{traceback.format_exc()}")
+        return JsonResponse({"error": "Password change failed."}, status=500)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

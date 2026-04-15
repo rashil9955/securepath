@@ -85,6 +85,17 @@ def create_2fa_pending_token(data: dict) -> str:
     return jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
 
 
+def create_password_reset_token(data: dict) -> str:
+    """
+    Short-lived (10 min) token issued after TOTP verification during forgot-password.
+    Carries type='password_reset' — only accepted by the reset endpoint.
+    """
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + timedelta(minutes=10)
+    to_encode.update({"exp": expire, "type": "password_reset"})
+    return jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+
+
 def verify_token(token: str, token_type: str = "access") -> Optional[dict]:
     """Verify and decode a JWT token"""
     try:
