@@ -36,6 +36,10 @@ export const AuthProvider = ({ children }) => {
     const login = async (email, password) => {
         try {
             const data = await authService.login(email, password);
+            if (data.requires_2fa) {
+                // Password was correct but 2FA is needed — don't log the user in yet
+                return { success: false, requires2FA: true, twoFaToken: data.two_fa_token };
+            }
             setUser(data.user);
             return { success: true, data };
         } catch (error) {
@@ -43,10 +47,23 @@ export const AuthProvider = ({ children }) => {
         }
     };
 
+    const verify2FA = async (twoFaToken, otp) => {
+        try {
+            const data = await authService.verify2FA(twoFaToken, otp);
+            setUser(data.user);
+            return { success: true, data };
+        } catch (error) {
+            return { success: false, error: error.message || 'Invalid code. Try again.' };
+        }
+    };
+
     const register = async (email, password, confirmPassword) => {
         try {
             const data = await authService.register(email, password, confirmPassword);
-            setUser(data.user);
+            // Do NOT call setUser here — the user must complete mandatory 2FA setup
+            // before gaining access to the dashboard. The access token is stored in
+            // localStorage by authService so subsequent API calls (setup2FA, enable2FA)
+            // still work.
             return { success: true, data };
         } catch (error) {
             return { success: false, error: error.message || 'Registration failed' };
@@ -70,6 +87,7 @@ export const AuthProvider = ({ children }) => {
         user,
         loading,
         login,
+        verify2FA,
         register,
         logout,
         isAuthenticated: !!user,

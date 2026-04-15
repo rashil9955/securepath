@@ -67,7 +67,55 @@ export const authService = {
             method: 'POST',
             body: JSON.stringify({ email, password }),
         });
-        // Store access token in localStorage as fallback for Authorization header
+        // If 2FA is required, return the pending token — don't store access_token yet
+        if (data.requires_2fa) {
+            return data;
+        }
+        if (data.access_token) {
+            this.setAccessToken(data.access_token);
+        }
+        return data;
+    },
+
+    async setup2FA() {
+        return apiCall('/2fa/setup', {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${this.getAccessToken()}` },
+        });
+    },
+
+    async enable2FA(otp) {
+        return apiCall('/2fa/enable', {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${this.getAccessToken()}` },
+            body: JSON.stringify({ otp }),
+        });
+    },
+
+    async disable2FA(password, otp) {
+        return apiCall('/2fa/disable', {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${this.getAccessToken()}` },
+            body: JSON.stringify({ password, otp }),
+        });
+    },
+
+    async get2FAStatus() {
+        return apiCall('/2fa/status', {
+            method: 'GET',
+            headers: { 'Authorization': `Bearer ${this.getAccessToken()}` },
+        });
+    },
+
+    async verify2FA(twoFaToken, otp, rememberDevice = false) {
+        const data = await apiCall('/2fa/login-verify', {
+            method: 'POST',
+            body: JSON.stringify({
+                two_fa_token: twoFaToken,
+                otp,
+                remember_device: rememberDevice,
+            }),
+        });
         if (data.access_token) {
             this.setAccessToken(data.access_token);
         }

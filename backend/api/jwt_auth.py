@@ -1,7 +1,7 @@
 """
 JWT authentication utilities for Django
 """
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 import jwt
 import bcrypt
@@ -54,9 +54,9 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     to_encode = data.copy()
     
     if expires_delta:
-        expire = datetime.utcnow() + expires_delta
+        expire = datetime.now(timezone.utc) + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(minutes=JWT_ACCESS_TOKEN_EXPIRE_MINUTES)
+        expire = datetime.now(timezone.utc) + timedelta(minutes=JWT_ACCESS_TOKEN_EXPIRE_MINUTES)
     
     to_encode.update({"exp": expire, "type": "access"})
     encoded_jwt = jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
@@ -66,10 +66,23 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
 def create_refresh_token(data: dict) -> str:
     """Create a JWT refresh token (longer expiration)"""
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(days=JWT_REFRESH_TOKEN_EXPIRE_DAYS)
+    expire = datetime.now(timezone.utc) + timedelta(days=JWT_REFRESH_TOKEN_EXPIRE_DAYS)
     to_encode.update({"exp": expire, "type": "refresh"})
     encoded_jwt = jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
     return encoded_jwt
+
+
+def create_2fa_pending_token(data: dict) -> str:
+    """
+    Short-lived (5 min) token issued after successful password verification
+    when the user has 2FA enabled.  Carries type='2fa_pending' so it cannot
+    be used as a normal access token.  The frontend must POST it to
+    /2fa/login-verify together with the OTP to receive real access tokens.
+    """
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + timedelta(minutes=5)
+    to_encode.update({"exp": expire, "type": "2fa_pending"})
+    return jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
 
 
 def verify_token(token: str, token_type: str = "access") -> Optional[dict]:

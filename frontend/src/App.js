@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
 import { AuthProvider } from './contexts/AuthContext';
 import ErrorBoundary from './components/ErrorBoundary';
@@ -12,10 +12,11 @@ import AuditLogView from './components/AuditLog/AuditLogView';
 import ReportsView from './components/Reports/ReportsView';
 import LoginPage from './pages/LoginPage';
 import RegisterPage from './pages/RegisterPage';
+import TwoFAModal from './components/TwoFAModal';
 import { useDashboardData } from './hooks/useDashboardData';
 import { NAV_ITEMS } from './config/constants';
 import { useAuth } from './contexts/AuthContext';
-import { LogOut } from 'lucide-react';
+import { LogOut, ShieldCheck, ShieldOff, ChevronDown } from 'lucide-react';
 
 // Dashboard component (protected)
 function SecurePathDashboard() {
@@ -42,6 +43,22 @@ function SecurePathDashboard() {
                 return <DashboardView stats={stats} transactions={transactions} loading={loading} onRefresh={refresh} />;
         }
     };
+
+    const [showDropdown, setShowDropdown] = useState(false);
+    const [show2FAModal, setShow2FAModal] = useState(false);
+    const [twoFAEnabled, setTwoFAEnabled] = useState(null); // null = unknown
+    const dropdownRef = useRef(null);
+
+    // Close dropdown when clicking outside
+    useEffect(() => {
+        const handler = (e) => {
+            if (dropdownRef.current && !dropdownRef.current.contains(e.target)) {
+                setShowDropdown(false);
+            }
+        };
+        document.addEventListener('mousedown', handler);
+        return () => document.removeEventListener('mousedown', handler);
+    }, []);
 
     const currentNav = NAV_ITEMS.find(i => i.id === activeTab);
     const userInitials = user?.email ? user.email.substring(0, 2).toUpperCase() : 'AD';
@@ -80,23 +97,63 @@ function SecurePathDashboard() {
                                 <div className="w-2 h-2 bg-cyber-success rounded-full animate-pulse shadow-[0_0_10px_#00FF94]"></div>
                                 <span className="text-sm font-bold text-cyber-success tracking-wide">SYSTEM ONLINE</span>
                             </div>
-                            <div className="flex items-center gap-3">
-                                <div className="text-right">
-                                    <p className="text-sm text-white font-medium">{user?.email || 'User'}</p>
-                                    <p className="text-xs text-cyber-text-secondary">Logged in</p>
-                                </div>
-                                <div className="w-10 h-10 rounded-full bg-gradient-to-br from-cyber-primary to-cyber-secondary p-[2px]">
-                                    <div className="w-full h-full rounded-full bg-black flex items-center justify-center text-white font-bold text-sm">
-                                        {userInitials}
-                                    </div>
-                                </div>
+                            {/* Profile dropdown */}
+                            <div className="relative" ref={dropdownRef}>
                                 <button
-                                    onClick={logout}
-                                    className="p-2 rounded-lg hover:bg-white/10 transition-colors text-cyber-text-secondary hover:text-white"
-                                    title="Logout"
+                                    onClick={() => setShowDropdown(v => !v)}
+                                    className="flex items-center gap-3 p-2 rounded-lg hover:bg-white/5 transition-colors"
                                 >
-                                    <LogOut size={20} />
+                                    <div className="text-right hidden sm:block">
+                                        <p className="text-sm text-white font-medium">{user?.email || 'User'}</p>
+                                        <p className="text-xs text-cyber-text-secondary">Logged in</p>
+                                    </div>
+                                    <div className="w-10 h-10 rounded-full bg-gradient-to-br from-cyber-primary to-cyber-secondary p-[2px]">
+                                        <div className="w-full h-full rounded-full bg-black flex items-center justify-center text-white font-bold text-sm">
+                                            {userInitials}
+                                        </div>
+                                    </div>
+                                    <ChevronDown size={16} className={`text-gray-400 transition-transform ${showDropdown ? 'rotate-180' : ''}`} />
                                 </button>
+
+                                {showDropdown && (
+                                    <div className="absolute right-0 top-14 w-64 bg-gray-900 border border-white/10 rounded-xl shadow-2xl z-50 overflow-hidden">
+                                        {/* User info */}
+                                        <div className="px-4 py-3 border-b border-white/10">
+                                            <p className="text-white text-sm font-medium truncate">{user?.email}</p>
+                                            <p className="text-gray-400 text-xs mt-0.5">Fraud Detection Analyst</p>
+                                        </div>
+
+                                        {/* 2FA option */}
+                                        <button
+                                            onClick={() => { setShowDropdown(false); setShow2FAModal(true); }}
+                                            className="w-full flex items-center gap-3 px-4 py-3 hover:bg-white/5 transition-colors text-left"
+                                        >
+                                            {twoFAEnabled === false ? (
+                                                <ShieldOff size={18} className="text-gray-400" />
+                                            ) : (
+                                                <ShieldCheck size={18} className="text-green-400" />
+                                            )}
+                                            <div>
+                                                <p className="text-sm text-white">Two-Factor Auth</p>
+                                                <p className={`text-xs ${twoFAEnabled ? 'text-green-400' : 'text-gray-400'}`}>
+                                                    {twoFAEnabled === null ? 'Click to manage' : twoFAEnabled ? 'Enabled' : 'Disabled'}
+                                                </p>
+                                            </div>
+                                        </button>
+
+                                        {/* Divider */}
+                                        <div className="border-t border-white/10" />
+
+                                        {/* Logout */}
+                                        <button
+                                            onClick={() => { setShowDropdown(false); logout(); }}
+                                            className="w-full flex items-center gap-3 px-4 py-3 hover:bg-red-500/10 transition-colors text-left"
+                                        >
+                                            <LogOut size={18} className="text-red-400" />
+                                            <span className="text-sm text-red-400">Sign Out</span>
+                                        </button>
+                                    </div>
+                                )}
                             </div>
                         </div>
                     </header>
@@ -106,6 +163,13 @@ function SecurePathDashboard() {
                     </div>
                 </main>
             </div>
+
+            {show2FAModal && (
+                <TwoFAModal
+                    onClose={() => setShow2FAModal(false)}
+                    onStatusChange={(enabled) => setTwoFAEnabled(enabled)}
+                />
+            )}
         </ErrorBoundary>
     );
 }

@@ -122,6 +122,25 @@ class User(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    # ── 2FA fields ──────────────────────────────────────────────────────────
+    # Secret is Fernet-encrypted at rest; never stored in plaintext.
+    # We encrypt (not hash) because the server must reconstruct the secret
+    # on every OTP verification — hashing is irreversible and cannot be used.
+    totp_secret = models.CharField(max_length=500, null=True, blank=True)
+    # Holds a newly generated secret during setup, before the user has
+    # proved they can produce a valid OTP.  Promoted to totp_secret on enable.
+    totp_pending_secret = models.CharField(max_length=500, null=True, blank=True)
+    is_2fa_enabled = models.BooleanField(default=False)
+    # JSON array of bcrypt-hashed one-time backup codes.
+    backup_codes = models.TextField(null=True, blank=True)
+    # TOTP counter (unix_ts // 30) of the last accepted code — replay guard.
+    last_otp_counter = models.IntegerField(null=True, blank=True)
+    # Brute-force protection
+    otp_failed_attempts = models.IntegerField(default=0)
+    otp_lockout_until = models.DateTimeField(null=True, blank=True)
+    # "Remember this device" — stores hashed device tokens (JSON list)
+    trusted_device_tokens = models.TextField(null=True, blank=True)
+
     class Meta:
         ordering = ['-created_at']
 
